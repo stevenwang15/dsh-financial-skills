@@ -3,6 +3,13 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/).
 
+## 未发布 / Unreleased
+
+### 修复
+
+- **GitHub 来源支持「技能就在仓库根」**：上游自 2026-11-17 起收录了一批根目录布局的仓库（`source.path: ""`）。此前归一化会把空 path 改写成 `plugins/<id>`，这些技能的详情与安装全部 404。现在空 path 原样保留，`resolve` 模板里的 `{path}` 会被真正替换掉（不再留下字面量 `{path}`），raw 地址也不会出现 `//`。
+- **支持 `source.exclude`**：上游对纯展示资源（`examples/`、`assets/showcase/`、`docs/` 等）声明了排除前缀，此前会被一并取回，容易撞上文件数 / 总量上限。现在按前缀跳过，与上游取件脚本 `install.py` 的行为一致。
+
 ## 0.1.1 — 2026-11-13
 
 ### 变更

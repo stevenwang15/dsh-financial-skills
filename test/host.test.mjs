@@ -26,7 +26,7 @@ import {
   normalizeCatalog,
   SNAPSHOT_FILE,
 } from '../lib/catalog.js'
-import { buildRawUrls, createSource, isSafeRelativePath, SOURCE_REPO_LABEL, SourceError } from '../lib/github.js'
+import { buildGithubRawUrls, buildRawUrls, createSource, isSafeRelativePath, SOURCE_REPO_LABEL, SourceError } from '../lib/github.js'
 import { SkillhubError, createSkillhub, extractZip } from '../lib/skillhub.js'
 import { isLoopback, readJson, sendJson, truncateToBytes } from '../lib/http.js'
 import { DETAIL_MARKDOWN_LIMIT, ROUTE_PATHS, ROUTES, createRoutes } from '../lib/routes.js'
@@ -430,6 +430,40 @@ test('catalog: normalizeCatalog 兼容 format 2（plugins/<id> 与旧 skillhub �
   assert.equal(sh.pluginPath, undefined)
 })
 
+test('catalog: github 根目录来源保留空 path，并透传 exclude', () => {
+  const raw = {
+    id: 'toy-root',
+    categories: [{ id: 'alpha', title: { zh: '甲类' } }],
+    skills: [
+      {
+        id: 'root-skill',
+        name: { zh: '根目录技能' },
+        category: 'alpha',
+        version: '1.0.0',
+        license: 'MIT',
+        source: {
+          type: 'github',
+          repo: 'acme/root-skill',
+          path: '',
+          ref: 'main',
+          exclude: ['examples', './docs/', 'examples', '..', ''],
+        },
+      },
+    ],
+  }
+  const catalog = normalizeCatalog(raw)
+  const skill = catalog.skills[0]
+  // path 显式为 "" 是「技能在仓库根」，不能改写成 plugins/<id>
+  assert.deepEqual(skill.source, {
+    type: 'github',
+    repo: 'acme/root-skill',
+    path: '',
+    ref: 'main',
+    vendored: false,
+    exclude: ['examples', 'docs'],
+  })
+  assert.equal(skill.pluginPath, undefined)
+})
 
 // ---------------------------------------------------------------------------
 // 目录抓取：镜像降级、缓存、快照、offline
@@ -732,6 +766,44 @@ test('github: contents API 不可达时用 jsDelivr 包清单兜底', async () =
   const files = await source.listFiles({ repo: 'acme/skills', path: 'skills/demo', ref: 'main' }, resolveGithub)
   assert.deepEqual(files, [{ path: 'SKILL.md', size: 12 }])
   assert.ok(calls.some((url) => url.startsWith('https://data.jsdelivr.com/')))
+})
+
+test('github: path 为空表示仓库根，exclude 前缀跳过，raw 地址不出现双斜杠', async () => {
+  const calls = []
+  const resolveGithub = {
+    raw: 'https://raw.githubusercontent.com/{repo}/{ref}/{path}/{file}',
+    api: 'https://api.github.com/repos/{repo}/contents/{path}?ref={ref}',
+  }
+  const coords = { repo: 'acme/root-skill', path: '', ref: 'main' }
+  const fetchImpl = async (url) => {
+    calls.push(url)
+    if (url === 'https://api.github.com/repos/acme/root-skill/contents/?ref=main') {
+      return jsonResponse([
+        { name: 'SKILL.md', type: 'file', size: 10 },
+        { name: 'examples', type: 'dir' },
+        { name: 'references', type: 'dir' },
+      ])
+    }
+    if (url === 'https://api.github.com/repos/acme/root-skill/contents/examples?ref=main') {
+      return jsonResponse([{ name: 'poster.png', type: 'file', size: 999 }])
+    }
+    if (url === 'https://api.github.com/repos/acme/root-skill/contents/references?ref=main') {
+      return jsonResponse([{ name: 'guide.md', type: 'file', size: 7 }])
+    }
+    if (url === 'https://raw.githubusercontent.com/acme/root-skill/main/SKILL.md') return bufferResponse(Buffer.from('# root'))
+    throw new Error(`unexpected url: ${url}`)
+  }
+  const source = createSource({ fetchImpl, timeoutMs: 1000 })
+  const files = await source.listFiles(coords, resolveGithub, { id: 'root-skill', exclude: ['examples'] })
+  assert.deepEqual(files, [
+    { path: 'SKILL.md', size: 10 },
+    { path: 'references/guide.md', size: 7 },
+  ])
+
+  assert.equal((await source.readFile(coords, resolveGithub, 'SKILL.md', { id: 'root-skill' })).toString('utf8'), '# root')
+  assert.ok(calls.includes('https://raw.githubusercontent.com/acme/root-skill/main/SKILL.md'))
+  assert.equal(calls.some((url) => url.includes('//SKILL.md')), false)
+  assert.equal(buildGithubRawUrls(resolveGithub, coords, 'SKILL.md')[0], 'https://raw.githubusercontent.com/acme/root-skill/main/SKILL.md')
 })
 
 test('github: fixture 兼容 plugins/<id> 与 skills/<id> 两种布局', async (t) => {
@@ -1041,6 +1113,43 @@ test('store: github 来源按坐标走 contents API + raw（raw 500 后回落 js
   assert.equal(calls.filter((url) => url.startsWith('https://raw.githubusercontent.com/')).length, 2)
   assert.equal(calls.filter((url) => url.startsWith('https://fastly.jsdelivr.net/')).length, 2)
   assert.equal(calls.some((url) => url.includes('data.jsdelivr.com')), false)
+})
+
+test('store: github 根目录来源（path 为空）装到 <id>/，exclude 目录不落盘', async (t) => {
+  const dir = await tempDir(t)
+  const installRoot = join(dir, 'skills')
+  const calls = []
+  const fetchImpl = async (url) => {
+    calls.push(url)
+    if (url === 'https://api.github.com/repos/acme/root-skill/contents/?ref=main') {
+      return jsonResponse([
+        { name: 'SKILL.md', type: 'file', size: 10 },
+        { name: 'examples', type: 'dir' },
+      ])
+    }
+    if (url === 'https://api.github.com/repos/acme/root-skill/contents/examples?ref=main') {
+      return jsonResponse([{ name: 'poster.png', type: 'file', size: 999 }])
+    }
+    if (url === 'https://raw.githubusercontent.com/acme/root-skill/main/SKILL.md') return bufferResponse(Buffer.from('# 根目录'))
+    throw new Error(`unexpected url: ${url}`)
+  }
+  const source = createSource({ fetchImpl, timeoutMs: 1000 })
+  const store = createStore({ dshHome: dir, installRoot, source, limits: DEFAULT_LIMITS })
+  const result = await store.install('root-skill', {
+    version: '1.0.0',
+    license: 'MIT',
+    source: { type: 'github', repo: 'acme/root-skill', path: '', ref: 'main', vendored: false, exclude: ['examples'] },
+    resolve: DEFAULT_RESOLVE,
+  })
+
+  assert.equal(result.files, 1)
+  assert.equal(await readFile(join(installRoot, 'root-skill', 'SKILL.md'), 'utf8'), '# 根目录')
+  assert.equal(existsSync(join(installRoot, 'root-skill', 'examples')), false)
+  assert.equal(calls.some((url) => url.includes('poster.png')), false)
+
+  const provenance = JSON.parse(await readFile(join(installRoot, 'root-skill', '.financial-skills.json'), 'utf8'))
+  assert.equal(provenance.sourceRepo, 'acme/root-skill')
+  assert.equal(provenance.sourcePath, '')
 })
 
 test('store: 目标已存在时返回 409 语义，原目录不受影响', async (t) => {
